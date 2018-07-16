@@ -51,6 +51,8 @@ PA_MODULE_LOAD_ONCE(true);
 #define SERVICE_TYPE_SOURCE "_non-monitor._sub._pulse-source._tcp"
 
 static const char* const valid_modargs[] = {
+    "disable_ipv4",
+    "disable_ipv6",
     NULL
 };
 
@@ -67,6 +69,7 @@ struct userdata {
     AvahiPoll *avahi_poll;
     AvahiClient *client;
     AvahiServiceBrowser *source_browser, *sink_browser;
+    AvahiProtocol protocol;
 
     pa_hashmap *tunnels;
 };
@@ -134,9 +137,14 @@ static void resolver_cb(
         void *userdata) {
 
     struct userdata *u = userdata;
-    struct tunnel *tnl;
+    struct tunnel *tnl = NULL;
 
     pa_assert(u);
+
+    if (u->protocol != AVAHI_PROTO_UNSPEC && u->protocol != protocol) {
+        pa_log_warn("Expected address protocol '%i' but received '%i'", u->protocol, protocol);
+        goto finish;
+    }
 
     tnl = tunnel_new(interface, protocol, name, type, domain);
 
@@ -278,12 +286,17 @@ static void browser_cb(
     if (flags & AVAHI_LOOKUP_RESULT_LOCAL)
         return;
 
+    if (u->protocol != AVAHI_PROTO_UNSPEC && u->protocol != protocol) {
+        pa_log_warn("Expected query protocol '%i' but received '%i'", u->protocol, protocol);
+        return;
+    }
+
     t = tunnel_new(interface, protocol, name, type, domain);
 
     if (event == AVAHI_BROWSER_NEW) {
 
         if (!pa_hashmap_get(u->tunnels, t))
-            if (!(avahi_service_resolver_new(u->client, interface, protocol, name, type, domain, AVAHI_PROTO_UNSPEC, 0, resolver_cb, u)))
+            if (!(avahi_service_resolver_new(u->client, interface, protocol, name, type, domain, u->protocol, 0, resolver_cb, u)))
                 pa_log("avahi_service_resolver_new() failed: %s", avahi_strerror(avahi_client_errno(u->client)));
 
         /* We ignore the returned resolver object here, since the we don't
@@ -303,6 +316,16 @@ static void browser_cb(
     tunnel_free(t);
 }
 
+/* Avahi browser and resolver callbacks only receive a concrete protocol;
+ * always AVAHI_PROTO_INET or AVAHI_PROTO_INET6 and never AVAHI_PROTO_UNSPEC. A
+ * new browser given UNSPEC will receive both (separate) INET and INET6 events.
+ * A new resolver given a query protocol of UNSPEC will default to querying
+ * with INET6. A new resolver given an address protocol of UNSPEC will always
+ * resolve a service to an address matching the query protocol. So a resolver
+ * with UNSPEC/UNSPEC is equivalent to INET6/INET6. Strangely, INET addresses
+ * via INET6 queries fail to resolve; all other combinations succeed (avahi
+ * 0.7). */
+
 static void client_callback(AvahiClient *c, AvahiClientState state, void *userdata) {
     struct userdata *u = userdata;
 
@@ -320,7 +343,8 @@ static void client_callback(AvahiClient *c, AvahiClientState state, void *userda
 
                 if (!(u->sink_browser = avahi_service_browser_new(
                               c,
-                              AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC,
+                              AVAHI_IF_UNSPEC,
+                              u->protocol,
                               SERVICE_TYPE_SINK,
                               NULL,
                               0,
@@ -335,7 +359,8 @@ static void client_callback(AvahiClient *c, AvahiClientState state, void *userda
 
                 if (!(u->source_browser = avahi_service_browser_new(
                               c,
-                              AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC,
+                              AVAHI_IF_UNSPEC,
+                              u->protocol,
                               SERVICE_TYPE_SOURCE,
                               NULL,
                               0,
@@ -384,6 +409,8 @@ int pa__init(pa_module*m) {
 
     struct userdata *u;
     pa_modargs *ma = NULL;
+    bool disable_ipv4, disable_ipv6;
+    AvahiProtocol protocol;
     int error;
 
     if (!(ma = pa_modargs_new(m->argument, valid_modargs))) {
@@ -391,10 +418,32 @@ int pa__init(pa_module*m) {
         goto fail;
     }
 
+    if (pa_modargs_get_value_boolean(ma, "disable_ipv4", &disable_ipv4) < 0) {
+        pa_log("Failed to parse argument 'disable_ipv4'.");
+        goto fail;
+    }
+
+    if (pa_modargs_get_value_boolean(ma, "disable_ipv6", &disable_ipv6) < 0) {
+        pa_log("Failed to parse argument 'disable_ipv6'.");
+        goto fail;
+    }
+
+    if (disable_ipv4 && disable_ipv6) {
+        pa_log("Given both 'disable_ipv4' and 'disable_ipv6', unloading.");
+        goto fail;
+    } else if (disable_ipv4)
+        protocol = AVAHI_PROTO_INET6;
+    else if (disable_ipv6)
+        protocol = AVAHI_PROTO_INET;
+    else
+        protocol = AVAHI_PROTO_UNSPEC;
+
+
     m->userdata = u = pa_xnew(struct userdata, 1);
     u->core = m->core;
     u->module = m;
     u->sink_browser = u->source_browser = NULL;
+    u->protocol = protocol;
 
     u->tunnels = pa_hashmap_new(tunnel_hash, tunnel_compare);
 
