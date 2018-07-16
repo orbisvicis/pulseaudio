@@ -60,15 +60,22 @@ PA_MODULE_USAGE(
 #define MAX_LATENCY_USEC (200 * PA_USEC_PER_MSEC)
 #define TUNNEL_THREAD_FAILED_MAINLOOP 1
 
-enum {
-    SINK_MESSAGE_PUT = PA_SINK_MESSAGE_MAX,
-};
-
 static void stream_state_cb(pa_stream *stream, void *userdata);
 static void stream_changed_buffer_attr_cb(pa_stream *stream, void *userdata);
 static void stream_set_buffer_attr_cb(pa_stream *stream, int success, void *userdata);
 static void context_state_cb(pa_context *c, void *userdata);
 static void sink_update_requested_latency_cb(pa_sink *s);
+
+enum {
+    TUNNEL_MESSAGE_CREATE_SINK,
+    TUNNEL_MESSAGE_CREATE_STREAM,
+};
+
+typedef struct {
+    pa_msgobject parent;
+} tunnel_msg;
+
+PA_DEFINE_PRIVATE_CLASS(tunnel_msg, pa_msgobject);
 
 struct userdata {
     pa_module *module;
@@ -85,11 +92,19 @@ struct userdata {
     bool update_stream_bufferattr_after_connect;
 
     bool connected;
+    bool created;
 
     char *cookie_file;
     char *remote_server;
     char *remote_sink_name;
+
+    tunnel_msg *msg;
+
+    pa_sink_new_data *sink_data;
 };
+
+static int stream_create(struct userdata *u);
+static int sink_create(struct userdata *u);
 
 static const char* const valid_modargs[] = {
     "sink_name",
@@ -144,6 +159,42 @@ static pa_proplist* tunnel_new_proplist(struct userdata *u) {
     return proplist;
 }
 
+static int tunnel_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
+    struct userdata *u = data;
+
+    pa_assert(u);
+
+    switch (code) {
+
+        /* Delivered from the IO thread, handled in the main thread. */
+        case TUNNEL_MESSAGE_CREATE_SINK:
+            pa_log_debug("Creating sink.");
+            if (sink_create(u) < 0) {
+                pa_module_unload_request(u->module, true);
+                return -1;
+            }
+            pa_sink_new_data_done(u->sink_data);
+            pa_xfree(u->sink_data);
+            u->sink_data = NULL;
+            pa_asyncmsgq_post(u->thread_mq->inq, PA_MSGOBJECT(u->msg), TUNNEL_MESSAGE_CREATE_STREAM, u, 0, NULL, NULL);
+            break;
+
+        /* Delivered from the main thread, handled in the IO thread. */
+        case TUNNEL_MESSAGE_CREATE_STREAM:
+            u->created = true;
+            pa_log_debug("Creating stream.");
+            if (stream_create(u) < 0) {
+                u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
+                return -1;
+            }
+            u->connected = true;
+            break;
+
+    }
+
+    return 0;
+}
+
 static void thread_func(void *userdata) {
     struct userdata *u = userdata;
     pa_proplist *proplist;
@@ -173,7 +224,7 @@ static void thread_func(void *userdata) {
                            u->remote_server,
                            PA_CONTEXT_NOAUTOSPAWN,
                            NULL) < 0) {
-        pa_log("Failed to connect libpulse context");
+        pa_log("Failed to connect libpulse context: %s", pa_strerror(pa_context_errno(u->context)));
         goto fail;
     }
 
@@ -187,7 +238,7 @@ static void thread_func(void *userdata) {
                 goto fail;
         }
 
-        if (PA_UNLIKELY(u->sink->thread_info.rewind_requested))
+        if (PA_UNLIKELY(u->created && u->sink->thread_info.rewind_requested))
             pa_sink_process_rewind(u->sink, 0);
 
         if (u->connected &&
@@ -244,6 +295,34 @@ finish:
     pa_log_debug("Thread shutting down");
 }
 
+static void context_state_cb(pa_context *c, void *userdata) {
+    struct userdata *u = userdata;
+    pa_assert(u);
+
+    switch (pa_context_get_state(c)) {
+        case PA_CONTEXT_UNCONNECTED:
+        case PA_CONTEXT_CONNECTING:
+        case PA_CONTEXT_AUTHORIZING:
+        case PA_CONTEXT_SETTING_NAME:
+            break;
+        case PA_CONTEXT_READY: {
+            pa_log_debug("Context successfully connected.");
+            pa_asyncmsgq_post(u->thread_mq->outq, PA_MSGOBJECT(u->msg), TUNNEL_MESSAGE_CREATE_SINK, u, 0, NULL, NULL);
+            break;
+        }
+        case PA_CONTEXT_FAILED:
+            pa_log_debug("Context failed: %s.", pa_strerror(pa_context_errno(u->context)));
+            u->connected = false;
+            u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
+            break;
+        case PA_CONTEXT_TERMINATED:
+            pa_log_debug("Context terminated.");
+            u->connected = false;
+            u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
+            break;
+    }
+}
+
 static void stream_state_cb(pa_stream *stream, void *userdata) {
     struct userdata *u = userdata;
 
@@ -251,7 +330,7 @@ static void stream_state_cb(pa_stream *stream, void *userdata) {
 
     switch (pa_stream_get_state(stream)) {
         case PA_STREAM_FAILED:
-            pa_log_error("Stream failed.");
+            pa_log_error("Stream failed: %s", pa_strerror(pa_context_errno(u->context)));
             u->connected = false;
             u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
             break;
@@ -291,78 +370,53 @@ static void stream_set_buffer_attr_cb(pa_stream *stream, int success, void *user
     stream_changed_buffer_attr_cb(stream, userdata);
 }
 
-static void context_state_cb(pa_context *c, void *userdata) {
-    struct userdata *u = userdata;
-    pa_assert(u);
+/* Handled in the IO thread. */
+static int stream_create(struct userdata *u) {
+    pa_proplist *proplist;
+    pa_buffer_attr bufferattr;
+    pa_usec_t requested_latency;
+    char *username = pa_get_user_name_malloc();
+    char *hostname = pa_get_host_name_malloc();
+    /* TODO: old tunnel put here the remote sink_name into stream name e.g. 'Null Output for lynxis@lazus' */
+    char *stream_name = pa_sprintf_malloc(_("Tunnel for %s@%s"), username, hostname);
+    pa_xfree(hostname);
+    pa_xfree(username);
 
-    switch (pa_context_get_state(c)) {
-        case PA_CONTEXT_UNCONNECTED:
-        case PA_CONTEXT_CONNECTING:
-        case PA_CONTEXT_AUTHORIZING:
-        case PA_CONTEXT_SETTING_NAME:
-            break;
-        case PA_CONTEXT_READY: {
-            pa_proplist *proplist;
-            pa_buffer_attr bufferattr;
-            pa_usec_t requested_latency;
-            char *username = pa_get_user_name_malloc();
-            char *hostname = pa_get_host_name_malloc();
-            /* TODO: old tunnel put here the remote sink_name into stream name e.g. 'Null Output for lynxis@lazus' */
-            char *stream_name = pa_sprintf_malloc(_("Tunnel for %s@%s"), username, hostname);
-            pa_xfree(hostname);
-            pa_xfree(username);
+    pa_assert(!u->stream);
 
-            pa_log_debug("Connection successful. Creating stream.");
-            pa_assert(!u->stream);
+    proplist = tunnel_new_proplist(u);
+    u->stream = pa_stream_new_with_proplist(u->context,
+                                            stream_name,
+                                            &u->sink->sample_spec,
+                                            &u->sink->channel_map,
+                                            proplist);
+    pa_proplist_free(proplist);
+    pa_xfree(stream_name);
 
-            proplist = tunnel_new_proplist(u);
-            u->stream = pa_stream_new_with_proplist(u->context,
-                                                    stream_name,
-                                                    &u->sink->sample_spec,
-                                                    &u->sink->channel_map,
-                                                    proplist);
-            pa_proplist_free(proplist);
-            pa_xfree(stream_name);
-
-            if (!u->stream) {
-                pa_log_error("Could not create a stream.");
-                u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
-                return;
-            }
-
-            requested_latency = pa_sink_get_requested_latency_within_thread(u->sink);
-            if (requested_latency == (pa_usec_t) -1)
-                requested_latency = u->sink->thread_info.max_latency;
-
-            reset_bufferattr(&bufferattr);
-            bufferattr.tlength = pa_usec_to_bytes(requested_latency, &u->sink->sample_spec);
-
-            pa_stream_set_state_callback(u->stream, stream_state_cb, userdata);
-            pa_stream_set_buffer_attr_callback(u->stream, stream_changed_buffer_attr_cb, userdata);
-            if (pa_stream_connect_playback(u->stream,
-                                           u->remote_sink_name,
-                                           &bufferattr,
-                                           PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_DONT_MOVE | PA_STREAM_START_CORKED | PA_STREAM_AUTO_TIMING_UPDATE,
-                                           NULL,
-                                           NULL) < 0) {
-                pa_log_error("Could not connect stream.");
-                u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
-            }
-            u->connected = true;
-            pa_asyncmsgq_post(u->thread_mq->outq, PA_MSGOBJECT(u->sink), SINK_MESSAGE_PUT, NULL, 0, NULL, NULL);
-            break;
-        }
-        case PA_CONTEXT_FAILED:
-            pa_log_debug("Context failed: %s.", pa_strerror(pa_context_errno(u->context)));
-            u->connected = false;
-            u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
-            break;
-        case PA_CONTEXT_TERMINATED:
-            pa_log_debug("Context terminated.");
-            u->connected = false;
-            u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
-            break;
+    if (!u->stream) {
+        pa_log_error("Could not create stream: %s", pa_strerror(pa_context_errno(u->context)));
+        return -1;
     }
+
+    requested_latency = pa_sink_get_requested_latency_within_thread(u->sink);
+    if (requested_latency == (pa_usec_t) -1)
+        requested_latency = u->sink->thread_info.max_latency;
+
+    reset_bufferattr(&bufferattr);
+    bufferattr.tlength = pa_usec_to_bytes(requested_latency, &u->sink->sample_spec);
+
+    pa_stream_set_state_callback(u->stream, stream_state_cb, u);
+    pa_stream_set_buffer_attr_callback(u->stream, stream_changed_buffer_attr_cb, u);
+    if (pa_stream_connect_playback(u->stream,
+                                   u->remote_sink_name,
+                                   &bufferattr,
+                                   PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_DONT_MOVE | PA_STREAM_START_CORKED | PA_STREAM_AUTO_TIMING_UPDATE,
+                                   NULL,
+                                   NULL) < 0) {
+        pa_log_error("Could not connect stream: %s", pa_strerror(pa_context_errno(u->context)));
+        return -1;
+    }
+    return 0;
 }
 
 static void sink_update_requested_latency_cb(pa_sink *s) {
@@ -435,13 +489,6 @@ static int sink_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t of
             *((int64_t*) data) = remote_latency;
             return 0;
         }
-
-        /* Delivered from the IO thread, handled in the main thread. */
-        case SINK_MESSAGE_PUT: {
-            if (u->connected)
-                pa_sink_put(u->sink);
-            return 0;
-        }
     }
     return pa_sink_process_msg(o, code, data, offset, chunk);
 }
@@ -480,10 +527,31 @@ static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state,
     return 0;
 }
 
+/* Handled in the main thread. */
+static int sink_create(struct userdata *u) {
+    if (!(u->sink = pa_sink_new(u->module->core, u->sink_data, PA_SINK_LATENCY | PA_SINK_DYNAMIC_LATENCY | PA_SINK_NETWORK))) {
+        pa_log("Failed to create sink.");
+        return -1;
+    }
+
+    u->sink->userdata = u;
+    u->sink->parent.process_msg = sink_process_msg_cb;
+    u->sink->set_state_in_io_thread = sink_set_state_in_io_thread_cb;
+    u->sink->update_requested_latency = sink_update_requested_latency_cb;
+    pa_sink_set_latency_range(u->sink, 0, MAX_LATENCY_USEC);
+
+    /* set thread message queue */
+    pa_sink_set_asyncmsgq(u->sink, u->thread_mq->inq);
+    pa_sink_set_rtpoll(u->sink, u->rtpoll);
+
+    pa_sink_put(u->sink);
+
+    return 0;
+}
+
 int pa__init(pa_module *m) {
     struct userdata *u = NULL;
     pa_modargs *ma = NULL;
-    pa_sink_new_data sink_data;
     pa_sample_spec ss;
     pa_channel_map map;
     const char *remote_server = NULL;
@@ -539,47 +607,36 @@ int pa__init(pa_module *m) {
      * with module-tunnel-sink-new. */
     u->rtpoll = pa_rtpoll_new();
 
-    /* Create sink */
-    pa_sink_new_data_init(&sink_data);
-    sink_data.driver = __FILE__;
-    sink_data.module = m;
+    /* Create sink data */
+    u->sink_data = pa_xnew(pa_sink_new_data, 1);
+    pa_sink_new_data_init(u->sink_data);
+    u->sink_data->driver = __FILE__;
+    u->sink_data->module = m;
 
     default_sink_name = pa_sprintf_malloc("tunnel-sink-new.%s", remote_server);
     sink_name = pa_modargs_get_value(ma, "sink_name", default_sink_name);
 
-    pa_sink_new_data_set_name(&sink_data, sink_name);
-    pa_sink_new_data_set_sample_spec(&sink_data, &ss);
-    pa_sink_new_data_set_channel_map(&sink_data, &map);
+    pa_sink_new_data_set_name(u->sink_data, sink_name);
+    pa_sink_new_data_set_sample_spec(u->sink_data, &ss);
+    pa_sink_new_data_set_channel_map(u->sink_data, &map);
 
-    pa_proplist_sets(sink_data.proplist, PA_PROP_DEVICE_CLASS, "sound");
-    pa_proplist_setf(sink_data.proplist,
+    pa_proplist_sets(u->sink_data->proplist, PA_PROP_DEVICE_CLASS, "sound");
+    pa_proplist_setf(u->sink_data->proplist,
                      PA_PROP_DEVICE_DESCRIPTION,
                      _("Tunnel to %s/%s"),
                      remote_server,
                      pa_strempty(u->remote_sink_name));
 
-    if (pa_modargs_get_proplist(ma, "sink_properties", sink_data.proplist, PA_UPDATE_REPLACE) < 0) {
+    if (pa_modargs_get_proplist(ma, "sink_properties", u->sink_data->proplist, PA_UPDATE_REPLACE) < 0) {
         pa_log("Invalid properties");
-        pa_sink_new_data_done(&sink_data);
-        goto fail;
-    }
-    if (!(u->sink = pa_sink_new(m->core, &sink_data, PA_SINK_LATENCY | PA_SINK_DYNAMIC_LATENCY | PA_SINK_NETWORK))) {
-        pa_log("Failed to create sink.");
-        pa_sink_new_data_done(&sink_data);
         goto fail;
     }
 
-    pa_sink_new_data_done(&sink_data);
-    u->sink->userdata = u;
-    u->sink->parent.process_msg = sink_process_msg_cb;
-    u->sink->set_state_in_io_thread = sink_set_state_in_io_thread_cb;
-    u->sink->update_requested_latency = sink_update_requested_latency_cb;
-    pa_sink_set_latency_range(u->sink, 0, MAX_LATENCY_USEC);
+    /* Setup initial message handler */
+    u->msg = pa_msgobject_new(tunnel_msg);
+    u->msg->parent.process_msg = tunnel_process_msg_cb;
 
-    /* set thread message queue */
-    pa_sink_set_asyncmsgq(u->sink, u->thread_mq->inq);
-    pa_sink_set_rtpoll(u->sink, u->rtpoll);
-
+    /* start IO thread */
     if (!(u->thread = pa_thread_new("tunnel-sink", thread_func, u))) {
         pa_log("Failed to create thread.");
         goto fail;
@@ -634,6 +691,14 @@ void pa__done(pa_module *m) {
 
     if (u->remote_server)
         pa_xfree(u->remote_server);
+
+    if (u->msg)
+        pa_xfree(u->msg);
+
+    if (u->sink_data) {
+        pa_sink_new_data_done(u->sink_data);
+        pa_xfree(u->sink_data);
+    }
 
     if (u->sink)
         pa_sink_unref(u->sink);

@@ -59,14 +59,21 @@ PA_MODULE_USAGE(
 
 #define TUNNEL_THREAD_FAILED_MAINLOOP 1
 
-enum {
-    SOURCE_MESSAGE_PUT = PA_SOURCE_MESSAGE_MAX,
-};
-
 static void stream_state_cb(pa_stream *stream, void *userdata);
 static void stream_read_cb(pa_stream *s, size_t length, void *userdata);
 static void context_state_cb(pa_context *c, void *userdata);
 static void source_update_requested_latency_cb(pa_source *s);
+
+enum {
+    TUNNEL_MESSAGE_CREATE_SOURCE,
+    TUNNEL_MESSAGE_CREATE_STREAM,
+};
+
+typedef struct {
+    pa_msgobject parent;
+} tunnel_msg;
+
+PA_DEFINE_PRIVATE_CLASS(tunnel_msg, pa_msgobject);
 
 struct userdata {
     pa_module *module;
@@ -87,7 +94,15 @@ struct userdata {
     char *cookie_file;
     char *remote_server;
     char *remote_source_name;
+
+    tunnel_msg *msg;
+
+    pa_source_new_data *source_data;
 };
+
+static int stream_create(struct userdata *u);
+static int source_create(struct userdata *u);
+static void read_new_samples(struct userdata *u);
 
 static const char* const valid_modargs[] = {
     "source_name",
@@ -133,63 +148,39 @@ static pa_proplist* tunnel_new_proplist(struct userdata *u) {
     return proplist;
 }
 
-static void stream_read_cb(pa_stream *s, size_t length, void *userdata) {
-    struct userdata *u = userdata;
-    u->new_data = true;
-}
-
-/* called from io context to read samples from the stream into our source */
-static void read_new_samples(struct userdata *u) {
-    const void *p;
-    size_t readable = 0;
-    pa_memchunk memchunk;
+static int tunnel_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
+    struct userdata *u = data;
 
     pa_assert(u);
-    u->new_data = false;
 
-    pa_memchunk_reset(&memchunk);
+    switch (code) {
 
-    if (PA_UNLIKELY(!u->connected || pa_stream_get_state(u->stream) != PA_STREAM_READY))
-        return;
-
-    readable = pa_stream_readable_size(u->stream);
-    while (readable > 0) {
-        size_t nbytes = 0;
-        if (PA_UNLIKELY(pa_stream_peek(u->stream, &p, &nbytes) != 0)) {
-            pa_log("pa_stream_peek() failed: %s", pa_strerror(pa_context_errno(u->context)));
-            u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
-            return;
-        }
-
-        if (PA_LIKELY(p)) {
-            /* we have valid data */
-            memchunk.memblock = pa_memblock_new_fixed(u->module->core->mempool, (void *) p, nbytes, true);
-            memchunk.length = nbytes;
-            memchunk.index = 0;
-
-            pa_source_post(u->source, &memchunk);
-            pa_memblock_unref_fixed(memchunk.memblock);
-        } else {
-            size_t bytes_to_generate = nbytes;
-
-            /* we have a hole. generate silence */
-            memchunk = u->source->silence;
-            pa_memblock_ref(memchunk.memblock);
-
-            while (bytes_to_generate > 0) {
-                if (bytes_to_generate < memchunk.length)
-                    memchunk.length = bytes_to_generate;
-
-                pa_source_post(u->source, &memchunk);
-                bytes_to_generate -= memchunk.length;
+        /* Delivered from the IO thread, handled in the main thread. */
+        case TUNNEL_MESSAGE_CREATE_SOURCE:
+            pa_log_debug("Creating source.");
+            if (source_create(u) < 0) {
+                pa_module_unload_request(u->module, true);
+                return -1;
             }
+            pa_source_new_data_done(u->source_data);
+            pa_xfree(u->source_data);
+            u->source_data = NULL;
+            pa_asyncmsgq_post(u->thread_mq->inq, PA_MSGOBJECT(u->msg), TUNNEL_MESSAGE_CREATE_STREAM, u, 0, NULL, NULL);
+            break;
 
-            pa_memblock_unref(memchunk.memblock);
-        }
+        /* Delivered from the main thread, handled in the IO thread. */
+        case TUNNEL_MESSAGE_CREATE_STREAM:
+            pa_log_debug("Creating stream.");
+            if (stream_create(u) < 0) {
+                u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
+                return -1;
+            }
+            u->connected = true;
+            break;
 
-        pa_stream_drop(u->stream);
-        readable -= nbytes;
     }
+
+    return 0;
 }
 
 static void thread_func(void *userdata) {
@@ -259,6 +250,34 @@ finish:
     pa_log_debug("Thread shutting down");
 }
 
+static void context_state_cb(pa_context *c, void *userdata) {
+    struct userdata *u = userdata;
+    pa_assert(u);
+
+    switch (pa_context_get_state(c)) {
+        case PA_CONTEXT_UNCONNECTED:
+        case PA_CONTEXT_CONNECTING:
+        case PA_CONTEXT_AUTHORIZING:
+        case PA_CONTEXT_SETTING_NAME:
+            break;
+        case PA_CONTEXT_READY: {
+            pa_log_debug("Context successfully connected.");
+            pa_asyncmsgq_post(u->thread_mq->outq, PA_MSGOBJECT(u->msg), TUNNEL_MESSAGE_CREATE_SOURCE, u, 0, NULL, NULL);
+            break;
+        }
+        case PA_CONTEXT_FAILED:
+            pa_log_debug("Context failed: %s.", pa_strerror(pa_context_errno(u->context)));
+            u->connected = false;
+            u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
+            break;
+        case PA_CONTEXT_TERMINATED:
+            pa_log_debug("Context terminated.");
+            u->connected = false;
+            u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
+            break;
+    }
+}
+
 static void stream_state_cb(pa_stream *stream, void *userdata) {
     struct userdata *u = userdata;
 
@@ -289,76 +308,110 @@ static void stream_state_cb(pa_stream *stream, void *userdata) {
     }
 }
 
-static void context_state_cb(pa_context *c, void *userdata) {
+static void stream_read_cb(pa_stream *s, size_t length, void *userdata) {
     struct userdata *u = userdata;
+    u->new_data = true;
+}
+
+/* called from io context to read samples from the stream into our source */
+static void read_new_samples(struct userdata *u) {
+    const void *p;
+    size_t readable = 0;
+    pa_memchunk memchunk;
+
     pa_assert(u);
+    u->new_data = false;
 
-    switch (pa_context_get_state(c)) {
-        case PA_CONTEXT_UNCONNECTED:
-        case PA_CONTEXT_CONNECTING:
-        case PA_CONTEXT_AUTHORIZING:
-        case PA_CONTEXT_SETTING_NAME:
-            break;
-        case PA_CONTEXT_READY: {
-            pa_proplist *proplist;
-            pa_buffer_attr bufferattr;
-            pa_usec_t requested_latency;
-            char *username = pa_get_user_name_malloc();
-            char *hostname = pa_get_host_name_malloc();
-            /* TODO: old tunnel put here the remote source_name into stream name e.g. 'Null Output for lynxis@lazus' */
-            char *stream_name = pa_sprintf_malloc(_("Tunnel for %s@%s"), username, hostname);
-            pa_xfree(username);
-            pa_xfree(hostname);
+    pa_memchunk_reset(&memchunk);
 
-            pa_log_debug("Connection successful. Creating stream.");
-            pa_assert(!u->stream);
+    if (PA_UNLIKELY(!u->connected || pa_stream_get_state(u->stream) != PA_STREAM_READY))
+        return;
 
-            proplist = tunnel_new_proplist(u);
-            u->stream = pa_stream_new_with_proplist(u->context,
-                                                    stream_name,
-                                                    &u->source->sample_spec,
-                                                    &u->source->channel_map,
-                                                    proplist);
-            pa_proplist_free(proplist);
-            pa_xfree(stream_name);
-
-            if (!u->stream) {
-                pa_log_error("Could not create a stream: %s", pa_strerror(pa_context_errno(u->context)));
-                u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
-                return;
-            }
-
-            requested_latency = pa_source_get_requested_latency_within_thread(u->source);
-            if (requested_latency == (uint32_t) -1)
-                requested_latency = u->source->thread_info.max_latency;
-
-            reset_bufferattr(&bufferattr);
-            bufferattr.fragsize = pa_usec_to_bytes(requested_latency, &u->source->sample_spec);
-
-            pa_stream_set_state_callback(u->stream, stream_state_cb, userdata);
-            pa_stream_set_read_callback(u->stream, stream_read_cb, userdata);
-            if (pa_stream_connect_record(u->stream,
-                                         u->remote_source_name,
-                                         &bufferattr,
-                                         PA_STREAM_INTERPOLATE_TIMING|PA_STREAM_DONT_MOVE|PA_STREAM_AUTO_TIMING_UPDATE|PA_STREAM_START_CORKED) < 0) {
-                pa_log_debug("Could not create stream: %s", pa_strerror(pa_context_errno(u->context)));
-                u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
-            }
-            u->connected = true;
-            pa_asyncmsgq_post(u->thread_mq->outq, PA_MSGOBJECT(u->source), SOURCE_MESSAGE_PUT, NULL, 0, NULL, NULL);
-            break;
+    readable = pa_stream_readable_size(u->stream);
+    while (readable > 0) {
+        size_t nbytes = 0;
+        if (PA_UNLIKELY(pa_stream_peek(u->stream, &p, &nbytes) != 0)) {
+            pa_log("pa_stream_peek() failed: %s", pa_strerror(pa_context_errno(u->context)));
+            u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
+            return;
         }
-        case PA_CONTEXT_FAILED:
-            pa_log_debug("Context failed with err %s.", pa_strerror(pa_context_errno(u->context)));
-            u->connected = false;
-            u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
-            break;
-        case PA_CONTEXT_TERMINATED:
-            pa_log_debug("Context terminated.");
-            u->connected = false;
-            u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
-            break;
+
+        if (PA_LIKELY(p)) {
+            /* we have valid data */
+            memchunk.memblock = pa_memblock_new_fixed(u->module->core->mempool, (void *) p, nbytes, true);
+            memchunk.length = nbytes;
+            memchunk.index = 0;
+
+            pa_source_post(u->source, &memchunk);
+            pa_memblock_unref_fixed(memchunk.memblock);
+        } else {
+            size_t bytes_to_generate = nbytes;
+
+            /* we have a hole. generate silence */
+            memchunk = u->source->silence;
+            pa_memblock_ref(memchunk.memblock);
+
+            while (bytes_to_generate > 0) {
+                if (bytes_to_generate < memchunk.length)
+                    memchunk.length = bytes_to_generate;
+
+                pa_source_post(u->source, &memchunk);
+                bytes_to_generate -= memchunk.length;
+            }
+
+            pa_memblock_unref(memchunk.memblock);
+        }
+
+        pa_stream_drop(u->stream);
+        readable -= nbytes;
     }
+}
+
+/* Handled in the IO thread. */
+static int stream_create(struct userdata *u) {
+    pa_proplist *proplist;
+    pa_buffer_attr bufferattr;
+    pa_usec_t requested_latency;
+    char *username = pa_get_user_name_malloc();
+    char *hostname = pa_get_host_name_malloc();
+    /* TODO: old tunnel put here the remote source_name into stream name e.g. 'Null Output for lynxis@lazus' */
+    char *stream_name = pa_sprintf_malloc(_("Tunnel for %s@%s"), username, hostname);
+    pa_xfree(username);
+    pa_xfree(hostname);
+
+    pa_assert(!u->stream);
+
+    proplist = tunnel_new_proplist(u);
+    u->stream = pa_stream_new_with_proplist(u->context,
+                                            stream_name,
+                                            &u->source->sample_spec,
+                                            &u->source->channel_map,
+                                            proplist);
+    pa_proplist_free(proplist);
+    pa_xfree(stream_name);
+
+    if (!u->stream) {
+        pa_log_error("Could not create stream: %s", pa_strerror(pa_context_errno(u->context)));
+        return -1;
+    }
+
+    requested_latency = pa_source_get_requested_latency_within_thread(u->source);
+    if (requested_latency == (pa_usec_t) -1)
+        requested_latency = u->source->thread_info.max_latency;
+
+    reset_bufferattr(&bufferattr);
+    bufferattr.fragsize = pa_usec_to_bytes(requested_latency, &u->source->sample_spec);
+
+    pa_stream_set_state_callback(u->stream, stream_state_cb, u);
+    pa_stream_set_read_callback(u->stream, stream_read_cb, u);
+    if (pa_stream_connect_record(u->stream,
+                                 u->remote_source_name,
+                                 &bufferattr,
+                                 PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_DONT_MOVE | PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_START_CORKED) < 0) {
+        pa_log_error("Could not connect stream: %s", pa_strerror(pa_context_errno(u->context)));
+        return -1;
+    }
+    return 0;
 }
 
 static void source_update_requested_latency_cb(pa_source *s) {
@@ -434,13 +487,6 @@ static int source_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t 
 
             return 0;
         }
-
-        /* Delivered from the IO thread, handled in the main thread. */
-        case SOURCE_MESSAGE_PUT: {
-            if (u->connected)
-                pa_source_put(u->source);
-            return 0;
-        }
     }
     return pa_source_process_msg(o, code, data, offset, chunk);
 }
@@ -479,10 +525,30 @@ static int source_set_state_in_io_thread_cb(pa_source *s, pa_source_state_t new_
     return 0;
 }
 
+/* Handled in the main thread. */
+static int source_create(struct userdata *u) {
+    if (!(u->source = pa_source_new(u->module->core, u->source_data, PA_SOURCE_LATENCY | PA_SOURCE_DYNAMIC_LATENCY | PA_SOURCE_NETWORK))) {
+        pa_log("Failed to create source.");
+        return -1;
+    }
+
+    u->source->userdata = u;
+    u->source->parent.process_msg = source_process_msg_cb;
+    u->source->set_state_in_io_thread = source_set_state_in_io_thread_cb;
+    u->source->update_requested_latency = source_update_requested_latency_cb;
+
+    /* set thread message queue */
+    pa_source_set_asyncmsgq(u->source, u->thread_mq->inq);
+    pa_source_set_rtpoll(u->source, u->rtpoll);
+
+    pa_source_put(u->source);
+
+    return 0;
+}
+
 int pa__init(pa_module *m) {
     struct userdata *u = NULL;
     pa_modargs *ma = NULL;
-    pa_source_new_data source_data;
     pa_sample_spec ss;
     pa_channel_map map;
     const char *remote_server = NULL;
@@ -535,45 +601,36 @@ int pa__init(pa_module *m) {
      * only works because it calls pa_asyncmsq_process_one(). */
     u->rtpoll = pa_rtpoll_new();
 
-    /* Create source */
-    pa_source_new_data_init(&source_data);
-    source_data.driver = __FILE__;
-    source_data.module = m;
+    /* Create source data */
+    u->source_data = pa_xnew(pa_source_new_data, 1);
+    pa_source_new_data_init(u->source_data);
+    u->source_data->driver = __FILE__;
+    u->source_data->module = m;
 
     default_source_name = pa_sprintf_malloc("tunnel-source-new.%s", remote_server);
     source_name = pa_modargs_get_value(ma, "source_name", default_source_name);
 
-    pa_source_new_data_set_name(&source_data, source_name);
-    pa_source_new_data_set_sample_spec(&source_data, &ss);
-    pa_source_new_data_set_channel_map(&source_data, &map);
+    pa_source_new_data_set_name(u->source_data, source_name);
+    pa_source_new_data_set_sample_spec(u->source_data, &ss);
+    pa_source_new_data_set_channel_map(u->source_data, &map);
 
-    pa_proplist_sets(source_data.proplist, PA_PROP_DEVICE_CLASS, "sound");
-    pa_proplist_setf(source_data.proplist,
+    pa_proplist_sets(u->source_data->proplist, PA_PROP_DEVICE_CLASS, "sound");
+    pa_proplist_setf(u->source_data->proplist,
                      PA_PROP_DEVICE_DESCRIPTION,
                      _("Tunnel to %s/%s"),
                      remote_server,
                      pa_strempty(u->remote_source_name));
 
-    if (pa_modargs_get_proplist(ma, "source_properties", source_data.proplist, PA_UPDATE_REPLACE) < 0) {
+    if (pa_modargs_get_proplist(ma, "source_properties", u->source_data->proplist, PA_UPDATE_REPLACE) < 0) {
         pa_log("Invalid properties");
-        pa_source_new_data_done(&source_data);
-        goto fail;
-    }
-    if (!(u->source = pa_source_new(m->core, &source_data, PA_SOURCE_LATENCY | PA_SOURCE_DYNAMIC_LATENCY | PA_SOURCE_NETWORK))) {
-        pa_log("Failed to create source.");
-        pa_source_new_data_done(&source_data);
         goto fail;
     }
 
-    pa_source_new_data_done(&source_data);
-    u->source->userdata = u;
-    u->source->parent.process_msg = source_process_msg_cb;
-    u->source->set_state_in_io_thread = source_set_state_in_io_thread_cb;
-    u->source->update_requested_latency = source_update_requested_latency_cb;
+    /* setup initial message handler */
+    u->msg = pa_msgobject_new(tunnel_msg);
+    u->msg->parent.process_msg = tunnel_process_msg_cb;
 
-    pa_source_set_asyncmsgq(u->source, u->thread_mq->inq);
-    pa_source_set_rtpoll(u->source, u->rtpoll);
-
+    /* start IO thread */
     if (!(u->thread = pa_thread_new("tunnel-source", thread_func, u))) {
         pa_log("Failed to create thread.");
         goto fail;
@@ -628,6 +685,14 @@ void pa__done(pa_module *m) {
 
     if (u->remote_server)
         pa_xfree(u->remote_server);
+
+    if (u->msg)
+        pa_xfree(u->msg);
+
+    if (u->source_data) {
+        pa_source_new_data_done(u->source_data);
+        pa_xfree(u->source_data);
+    }
 
     if (u->source)
         pa_source_unref(u->source);

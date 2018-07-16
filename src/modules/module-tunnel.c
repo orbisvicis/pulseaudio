@@ -131,7 +131,8 @@ enum {
     SINK_MESSAGE_REQUEST = PA_SINK_MESSAGE_MAX,
     SINK_MESSAGE_REMOTE_SUSPEND,
     SINK_MESSAGE_UPDATE_LATENCY,
-    SINK_MESSAGE_POST
+    SINK_MESSAGE_POST,
+    SINK_MESSAGE_CREATED,
 };
 
 #define DEFAULT_TLENGTH_MSEC 150
@@ -142,7 +143,7 @@ enum {
 enum {
     SOURCE_MESSAGE_POST = PA_SOURCE_MESSAGE_MAX,
     SOURCE_MESSAGE_REMOTE_SUSPEND,
-    SOURCE_MESSAGE_UPDATE_LATENCY
+    SOURCE_MESSAGE_UPDATE_LATENCY,
 };
 
 #define DEFAULT_FRAGSIZE_MSEC 25
@@ -196,10 +197,13 @@ struct userdata {
 
     char *server_name;
 #ifdef TUNNEL_SINK
+    pa_sink_new_data *sink_data;
     char *sink_name;
     pa_sink *sink;
     size_t requested_bytes;
+    bool sink_created;
 #else
+    pa_source_new_data *source_data;
     char *source_name;
     pa_source *source;
     pa_mcalign *mcalign;
@@ -241,6 +245,11 @@ struct userdata {
 };
 
 static void request_latency(struct userdata *u);
+#ifdef TUNNEL_SINK
+static int sink_create(struct userdata *u);
+#else
+static int source_create(struct userdata *u);
+#endif
 
 /* Called from main context */
 static void command_stream_or_client_event(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata) {
@@ -550,6 +559,11 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
             return 0;
         }
 
+        case SINK_MESSAGE_CREATED:
+
+            u->sink_created = true;
+            return 0;
+
         case SINK_MESSAGE_POST:
 
             /* OK, This might be a bit confusing. This message is
@@ -717,7 +731,7 @@ static void thread_func(void *userdata) {
         int ret;
 
 #ifdef TUNNEL_SINK
-        if (PA_UNLIKELY(u->sink->thread_info.rewind_requested))
+        if (PA_UNLIKELY(u->sink_created && u->sink->thread_info.rewind_requested))
             pa_sink_process_rewind(u->sink, 0);
 #endif
 
@@ -1599,9 +1613,17 @@ static void setup_complete_callback(pa_pdispatch *pd, uint32_t command, uint32_t
     }
 
 #ifdef TUNNEL_SINK
-    pa_sink_put(u->sink);
+    if (sink_create(u) < 0)
+        goto fail;
+    pa_sink_new_data_done(u->sink_data);
+    pa_xfree(u->sink_data);
+    u->sink_data = NULL;
 #else
-    pa_source_put(u->source);
+    if (source_create(u) < 0)
+        goto fail;
+    pa_source_new_data_done(u->source_data);
+    pa_xfree(u->source_data);
+    u->source_data = NULL;
 #endif
 
     /* Starting with protocol version 13 the MSB of the version tag
@@ -1922,6 +1944,58 @@ static void sink_set_mute(pa_sink *sink) {
 
 #endif
 
+#ifdef TUNNEL_SINK
+/* Called from main context */
+static int sink_create(struct userdata *u) {
+    if (!(u->sink = pa_sink_new(u->module->core, u->sink_data, PA_SINK_NETWORK|PA_SINK_LATENCY))) {
+        pa_log("Failed to create sink.");
+        return -1;
+    }
+
+    u->sink->userdata = u;
+    u->sink->parent.process_msg = sink_process_msg;
+    u->sink->set_state_in_main_thread = sink_set_state_in_main_thread_cb;
+    pa_sink_set_set_volume_callback(u->sink, sink_set_volume);
+    pa_sink_set_set_mute_callback(u->sink, sink_set_mute);
+
+    u->sink->refresh_volume = u->sink->refresh_muted = false;
+
+/*     pa_sink_set_latency_range(u->sink, MIN_NETWORK_LATENCY_USEC, 0); */
+
+    pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);
+    pa_sink_set_rtpoll(u->sink, u->rtpoll);
+
+    pa_sink_put(u->sink);
+
+    pa_asyncmsgq_post(u->sink->asyncmsgq, PA_MSGOBJECT(u->sink), SINK_MESSAGE_CREATED, NULL, 0, NULL, NULL);
+
+    return 0;
+}
+#else
+/* Called from main context */
+static int source_create(struct userdata *u) {
+    if (!(u->source = pa_source_new(u->module->core, u->source_data, PA_SOURCE_NETWORK|PA_SOURCE_LATENCY))) {
+        pa_log("Failed to create source.");
+        return -1;
+    }
+
+    u->source->userdata = u;
+    u->source->parent.process_msg = source_process_msg;
+    u->source->set_state_in_main_thread = source_set_state_in_main_thread_cb;
+
+/*     pa_source_set_latency_range(u->source, MIN_NETWORK_LATENCY_USEC, 0); */
+
+    pa_source_set_asyncmsgq(u->source, u->thread_mq.inq);
+    pa_source_set_rtpoll(u->source, u->rtpoll);
+
+    u->mcalign = pa_mcalign_new(pa_frame_size(&u->source->sample_spec));
+
+    pa_source_put(u->source);
+
+    return 0;
+}
+#endif
+
 int pa__init(pa_module*m) {
     pa_modargs *ma = NULL;
     struct userdata *u = NULL;
@@ -1930,11 +2004,6 @@ int pa__init(pa_module*m) {
     pa_sample_spec ss;
     pa_channel_map map;
     char *dn = NULL;
-#ifdef TUNNEL_SINK
-    pa_sink_new_data data;
-#else
-    pa_source_new_data data;
-#endif
     bool automatic;
 #ifdef HAVE_X11
     xcb_connection_t *xcb = NULL;
@@ -2130,90 +2199,49 @@ int pa__init(pa_module*m) {
     pa_socket_client_set_callback(u->client, on_connection, u);
 
 #ifdef TUNNEL_SINK
+    u->sink_data = pa_xnew(pa_sink_new_data, 1);
+    pa_sink_new_data_init(u->sink_data);
 
     if (!(dn = pa_xstrdup(pa_modargs_get_value(ma, "sink_name", NULL))))
         dn = pa_sprintf_malloc("tunnel-sink.%s", u->server_name);
 
-    pa_sink_new_data_init(&data);
-    data.driver = __FILE__;
-    data.module = m;
-    data.namereg_fail = false;
-    pa_sink_new_data_set_name(&data, dn);
-    pa_sink_new_data_set_sample_spec(&data, &ss);
-    pa_sink_new_data_set_channel_map(&data, &map);
-    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "%s%s%s", pa_strempty(u->sink_name), u->sink_name ? " on " : "", u->server_name);
-    pa_proplist_sets(data.proplist, "tunnel.remote.server", u->server_name);
+    u->sink_data->driver = __FILE__;
+    u->sink_data->module = m;
+    u->sink_data->namereg_fail = false;
+    pa_sink_new_data_set_name(u->sink_data, dn);
+    pa_sink_new_data_set_sample_spec(u->sink_data, &ss);
+    pa_sink_new_data_set_channel_map(u->sink_data, &map);
+    pa_proplist_setf(u->sink_data->proplist, PA_PROP_DEVICE_DESCRIPTION, "%s%s%s", pa_strempty(u->sink_name), u->sink_name ? " on " : "", u->server_name);
+    pa_proplist_sets(u->sink_data->proplist, "tunnel.remote.server", u->server_name);
     if (u->sink_name)
-        pa_proplist_sets(data.proplist, "tunnel.remote.sink", u->sink_name);
+        pa_proplist_sets(u->sink_data->proplist, "tunnel.remote.sink", u->sink_name);
 
-    if (pa_modargs_get_proplist(ma, "sink_properties", data.proplist, PA_UPDATE_REPLACE) < 0) {
+    if (pa_modargs_get_proplist(ma, "sink_properties", u->sink_data->proplist, PA_UPDATE_REPLACE) < 0) {
         pa_log("Invalid properties");
-        pa_sink_new_data_done(&data);
         goto fail;
     }
-
-    u->sink = pa_sink_new(m->core, &data, PA_SINK_NETWORK|PA_SINK_LATENCY);
-    pa_sink_new_data_done(&data);
-
-    if (!u->sink) {
-        pa_log("Failed to create sink.");
-        goto fail;
-    }
-
-    u->sink->parent.process_msg = sink_process_msg;
-    u->sink->userdata = u;
-    u->sink->set_state_in_main_thread = sink_set_state_in_main_thread_cb;
-    pa_sink_set_set_volume_callback(u->sink, sink_set_volume);
-    pa_sink_set_set_mute_callback(u->sink, sink_set_mute);
-
-    u->sink->refresh_volume = u->sink->refresh_muted = false;
-
-/*     pa_sink_set_latency_range(u->sink, MIN_NETWORK_LATENCY_USEC, 0); */
-
-    pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);
-    pa_sink_set_rtpoll(u->sink, u->rtpoll);
-
 #else
+    u->source_data = pa_xnew(pa_source_new_data, 1);
+    pa_source_new_data_init(u->source_data);
 
     if (!(dn = pa_xstrdup(pa_modargs_get_value(ma, "source_name", NULL))))
         dn = pa_sprintf_malloc("tunnel-source.%s", u->server_name);
 
-    pa_source_new_data_init(&data);
-    data.driver = __FILE__;
-    data.module = m;
-    data.namereg_fail = false;
-    pa_source_new_data_set_name(&data, dn);
-    pa_source_new_data_set_sample_spec(&data, &ss);
-    pa_source_new_data_set_channel_map(&data, &map);
-    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "%s%s%s", pa_strempty(u->source_name), u->source_name ? " on " : "", u->server_name);
-    pa_proplist_sets(data.proplist, "tunnel.remote.server", u->server_name);
+    u->source_data->driver = __FILE__;
+    u->source_data->module = m;
+    u->source_data->namereg_fail = false;
+    pa_source_new_data_set_name(u->source_data, dn);
+    pa_source_new_data_set_sample_spec(u->source_data, &ss);
+    pa_source_new_data_set_channel_map(u->source_data, &map);
+    pa_proplist_setf(u->source_data->proplist, PA_PROP_DEVICE_DESCRIPTION, "%s%s%s", pa_strempty(u->source_name), u->source_name ? " on " : "", u->server_name);
+    pa_proplist_sets(u->source_data->proplist, "tunnel.remote.server", u->server_name);
     if (u->source_name)
-        pa_proplist_sets(data.proplist, "tunnel.remote.source", u->source_name);
+        pa_proplist_sets(u->source_data->proplist, "tunnel.remote.source", u->source_name);
 
-    if (pa_modargs_get_proplist(ma, "source_properties", data.proplist, PA_UPDATE_REPLACE) < 0) {
+    if (pa_modargs_get_proplist(ma, "source_properties", u->source_data->proplist, PA_UPDATE_REPLACE) < 0) {
         pa_log("Invalid properties");
-        pa_source_new_data_done(&data);
         goto fail;
     }
-
-    u->source = pa_source_new(m->core, &data, PA_SOURCE_NETWORK|PA_SOURCE_LATENCY);
-    pa_source_new_data_done(&data);
-
-    if (!u->source) {
-        pa_log("Failed to create source.");
-        goto fail;
-    }
-
-    u->source->parent.process_msg = source_process_msg;
-    u->source->set_state_in_main_thread = source_set_state_in_main_thread_cb;
-    u->source->userdata = u;
-
-/*     pa_source_set_latency_range(u->source, MIN_NETWORK_LATENCY_USEC, 0); */
-
-    pa_source_set_asyncmsgq(u->source, u->thread_mq.inq);
-    pa_source_set_rtpoll(u->source, u->rtpoll);
-
-    u->mcalign = pa_mcalign_new(pa_frame_size(&u->source->sample_spec));
 #endif
 
     u->time_event = NULL;
@@ -2298,6 +2326,18 @@ void pa__done(pa_module*m) {
 #else
     if (u->source)
         pa_source_unref(u->source);
+#endif
+
+#ifdef TUNNEL_SINK
+    if (u->sink_data) {
+        pa_sink_new_data_done(u->sink_data);
+        pa_xfree(u->sink_data);
+    }
+#else
+    if (u->source_data) {
+        pa_source_new_data_done(u->source_data);
+        pa_xfree(u->source_data);
+    }
 #endif
 
     if (u->rtpoll)
