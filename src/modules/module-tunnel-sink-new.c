@@ -60,6 +60,10 @@ PA_MODULE_USAGE(
 #define MAX_LATENCY_USEC (200 * PA_USEC_PER_MSEC)
 #define TUNNEL_THREAD_FAILED_MAINLOOP 1
 
+enum {
+    SINK_MESSAGE_PUT = PA_SINK_MESSAGE_MAX,
+};
+
 static void stream_state_cb(pa_stream *stream, void *userdata);
 static void stream_changed_buffer_attr_cb(pa_stream *stream, void *userdata);
 static void stream_set_buffer_attr_cb(pa_stream *stream, int success, void *userdata);
@@ -345,6 +349,7 @@ static void context_state_cb(pa_context *c, void *userdata) {
                 u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
             }
             u->connected = true;
+            pa_asyncmsgq_send(u->thread_mq->outq, PA_MSGOBJECT(u->sink), SINK_MESSAGE_PUT, NULL, 0, NULL);
             break;
         }
         case PA_CONTEXT_FAILED:
@@ -402,6 +407,7 @@ static int sink_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t of
     struct userdata *u = PA_SINK(o)->userdata;
 
     switch (code) {
+        /* Delivered from the main thread, handled in the IO thread. */
         case PA_SINK_MESSAGE_GET_LATENCY: {
             int negative;
             pa_usec_t remote_latency;
@@ -427,6 +433,13 @@ static int sink_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t of
             }
 
             *((int64_t*) data) = remote_latency;
+            return 0;
+        }
+
+        /* Delivered from the IO thread, handled in the main thread. */
+        case SINK_MESSAGE_PUT: {
+            if (u->connected)
+                pa_sink_put(u->sink);
             return 0;
         }
     }
@@ -572,7 +585,6 @@ int pa__init(pa_module *m) {
         goto fail;
     }
 
-    pa_sink_put(u->sink);
     pa_modargs_free(ma);
     pa_xfree(default_sink_name);
 

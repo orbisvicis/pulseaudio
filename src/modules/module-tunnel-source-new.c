@@ -59,6 +59,10 @@ PA_MODULE_USAGE(
 
 #define TUNNEL_THREAD_FAILED_MAINLOOP 1
 
+enum {
+    SOURCE_MESSAGE_PUT = PA_SOURCE_MESSAGE_MAX,
+};
+
 static void stream_state_cb(pa_stream *stream, void *userdata);
 static void stream_read_cb(pa_stream *s, size_t length, void *userdata);
 static void context_state_cb(pa_context *c, void *userdata);
@@ -341,6 +345,7 @@ static void context_state_cb(pa_context *c, void *userdata) {
                 u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
             }
             u->connected = true;
+            pa_asyncmsgq_send(u->thread_mq->outq, PA_MSGOBJECT(u->source), SOURCE_MESSAGE_PUT, NULL, 0, NULL);
             break;
         }
         case PA_CONTEXT_FAILED:
@@ -397,6 +402,7 @@ static int source_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t 
     struct userdata *u = PA_SOURCE(o)->userdata;
 
     switch (code) {
+        /* Delivered from the main thread, handled in the IO thread. */
         case PA_SOURCE_MESSAGE_GET_LATENCY: {
             int negative;
             pa_usec_t remote_latency;
@@ -426,6 +432,13 @@ static int source_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t 
             else
                 *((int64_t*) data) = remote_latency;
 
+            return 0;
+        }
+
+        /* Delivered from the IO thread, handled in the main thread. */
+        case SOURCE_MESSAGE_PUT: {
+            if (u->connected)
+                pa_source_put(u->source);
             return 0;
         }
     }
@@ -566,7 +579,6 @@ int pa__init(pa_module *m) {
         goto fail;
     }
 
-    pa_source_put(u->source);
     pa_modargs_free(ma);
     pa_xfree(default_source_name);
 

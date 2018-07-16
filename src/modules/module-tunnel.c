@@ -1598,6 +1598,12 @@ static void setup_complete_callback(pa_pdispatch *pd, uint32_t command, uint32_t
         goto fail;
     }
 
+#ifdef TUNNEL_SINK
+    pa_sink_put(u->sink);
+#else
+    pa_source_put(u->source);
+#endif
+
     /* Starting with protocol version 13 the MSB of the version tag
     reflects if shm is enabled for this connection or not. We don't
     support SHM here at all, so we just ignore this. */
@@ -2223,12 +2229,6 @@ int pa__init(pa_module*m) {
         pa_log("Failed to create thread.");
         goto fail;
     }
-
-#ifdef TUNNEL_SINK
-    pa_sink_put(u->sink);
-#else
-    pa_source_put(u->source);
-#endif
 
     pa_xfree(dn);
 
