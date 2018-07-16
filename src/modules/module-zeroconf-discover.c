@@ -53,6 +53,7 @@ PA_MODULE_LOAD_ONCE(true);
 static const char* const valid_modargs[] = {
     "disable_ipv4",
     "disable_ipv6",
+    "one_per_name_type",
     NULL
 };
 
@@ -74,6 +75,14 @@ struct userdata {
     pa_hashmap *tunnels;
 };
 
+static unsigned tunnel_hash_simple(const void *p) {
+    const struct tunnel *t = p;
+
+    return
+        pa_idxset_string_hash_func(t->name) +
+        pa_idxset_string_hash_func(t->type) +
+}
+
 static unsigned tunnel_hash(const void *p) {
     const struct tunnel *t = p;
 
@@ -83,6 +92,18 @@ static unsigned tunnel_hash(const void *p) {
         pa_idxset_string_hash_func(t->name) +
         pa_idxset_string_hash_func(t->type) +
         pa_idxset_string_hash_func(t->domain);
+}
+
+static int tunnel_compare_simple(const void *a, const void *b) {
+    const struct tunnel *ta = a, *tb = b;
+    int r;
+
+    if ((r = strcmp(ta->name, tb->name)))
+        return r;
+    if ((r = strcmp(ta->type, tb->type)))
+        return r;
+
+    return 0;
 }
 
 static int tunnel_compare(const void *a, const void *b) {
@@ -147,6 +168,12 @@ static void resolver_cb(
     }
 
     tnl = tunnel_new(interface, protocol, name, type, domain);
+
+    if (pa_hashmap_get(u->tunnels, tnl)) {
+        pa_log_debug("Tunnel [%i,%i,%s,%s,%s] already mapped, skipping.",
+                     interface, protocol, name, type, domain);
+        goto finish;
+    }
 
     if (event != AVAHI_RESOLVER_FOUND)
         pa_log("Resolving of '%s' failed: %s", name, avahi_strerror(avahi_client_errno(u->client)));
@@ -295,6 +322,8 @@ static void browser_cb(
 
     if (event == AVAHI_BROWSER_NEW) {
 
+        /* Since the resolver is asynchronous and the hashmap may not yet be
+         * updated, this check must be duplicated in the resolver callback. */
         if (!pa_hashmap_get(u->tunnels, t))
             if (!(avahi_service_resolver_new(u->client, interface, protocol, name, type, domain, u->protocol, 0, resolver_cb, u)))
                 pa_log("avahi_service_resolver_new() failed: %s", avahi_strerror(avahi_client_errno(u->client)));
@@ -304,9 +333,11 @@ static void browser_cb(
          * it from the callback */
 
     } else if (event == AVAHI_BROWSER_REMOVE) {
-        struct tunnel *t2;
+        struct tunnel *t2 = pa_hashmap_get(u->tunnels, t);
 
-        if ((t2 = pa_hashmap_get(u->tunnels, t))) {
+        /* A full comparison is required even if 'one_per_name_type' is true.
+         * Yes, this is redundant if it's false. */
+        if (t2 && !tunnel_compare(t2, t)) {
             pa_module_unload_request_by_index(u->core, t2->module_index, true);
             pa_hashmap_remove(u->tunnels, t2);
             tunnel_free(t2);
@@ -417,6 +448,7 @@ int pa__init(pa_module*m) {
     struct userdata *u;
     pa_modargs *ma = NULL;
     bool disable_ipv4, disable_ipv6;
+    bool one_per_name_type;
     AvahiProtocol protocol;
     int error;
 
@@ -432,6 +464,11 @@ int pa__init(pa_module*m) {
 
     if (pa_modargs_get_value_boolean(ma, "disable_ipv6", &disable_ipv6) < 0) {
         pa_log("Failed to parse argument 'disable_ipv6'.");
+        goto fail;
+    }
+
+    if (pa_modargs_get_value_boolean(ma, "one_per_name_type", &one_per_name_type) < 0) {
+        pa_log("Failed to parse argument 'one_per_name_type'.");
         goto fail;
     }
 
@@ -452,7 +489,10 @@ int pa__init(pa_module*m) {
     u->client = u->sink_browser = u->source_browser = NULL;
     u->protocol = protocol;
 
-    u->tunnels = pa_hashmap_new(tunnel_hash, tunnel_compare);
+    if (one_per_name_type)
+        u->tunnels = pa_hashmap_new(tunnel_hash_simple, tunnel_compare_simple);
+    else
+        u->tunnels = pa_hashmap_new(tunnel_hash, tunnel_compare);
 
     u->avahi_poll = pa_avahi_poll_new(m->core->mainloop);
 
