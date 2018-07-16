@@ -379,10 +379,17 @@ static void client_callback(AvahiClient *c, AvahiClientState state, void *userda
 
                 pa_log_debug("Avahi daemon disconnected.");
 
-                if (!(u->client = avahi_client_new(u->avahi_poll, AVAHI_CLIENT_NO_FAIL, client_callback, u, &error))) {
+                /* Frees all associated resources, i.e. browsers, resolvers,
+                 * and groups. */
+                avahi_client_free(c);
+                u->client = u->sink_browser = u->source_browser = NULL;
+
+                if (!avahi_client_new(u->avahi_poll, AVAHI_CLIENT_NO_FAIL, client_callback, u, &error)) {
                     pa_log("avahi_client_new() failed: %s", avahi_strerror(error));
                     pa_module_unload_request(u->module, true);
                 }
+
+                break;
             }
 
             /* Fall through */
@@ -442,14 +449,21 @@ int pa__init(pa_module*m) {
     m->userdata = u = pa_xnew(struct userdata, 1);
     u->core = m->core;
     u->module = m;
-    u->sink_browser = u->source_browser = NULL;
+    u->client = u->sink_browser = u->source_browser = NULL;
     u->protocol = protocol;
 
     u->tunnels = pa_hashmap_new(tunnel_hash, tunnel_compare);
 
     u->avahi_poll = pa_avahi_poll_new(m->core->mainloop);
 
-    if (!(u->client = avahi_client_new(u->avahi_poll, AVAHI_CLIENT_NO_FAIL, client_callback, u, &error))) {
+    /* The client callback is run for the first time within 'avahi_client_new',
+     * and on AVAHI_CLIENT_FAILURE may free the old client and create a new
+     * client assigned to 'userdata.client'. If so 'avahi_client_new' will
+     * return a pointer to already-freed data. When 'avahi_client_new' fails it
+     * returns NULL and does not run the callback; 'userdata.client' remains
+     * NULL (see above). Otherwise the callback is run, ensuring that
+     * 'userdata.client' is appropriately set. */
+    if (!avahi_client_new(u->avahi_poll, AVAHI_CLIENT_NO_FAIL, client_callback, u, &error)) {
         pa_log("pa_avahi_client_new() failed: %s", avahi_strerror(error));
         goto fail;
     }
