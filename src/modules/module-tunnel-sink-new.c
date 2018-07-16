@@ -349,7 +349,7 @@ static void context_state_cb(pa_context *c, void *userdata) {
                 u->thread_mainloop_api->quit(u->thread_mainloop_api, TUNNEL_THREAD_FAILED_MAINLOOP);
             }
             u->connected = true;
-            pa_asyncmsgq_send(u->thread_mq->outq, PA_MSGOBJECT(u->sink), SINK_MESSAGE_PUT, NULL, 0, NULL);
+            pa_asyncmsgq_post(u->thread_mq->outq, PA_MSGOBJECT(u->sink), SINK_MESSAGE_PUT, NULL, 0, NULL, NULL);
             break;
         }
         case PA_CONTEXT_FAILED:

@@ -80,7 +80,7 @@ static unsigned tunnel_hash_simple(const void *p) {
 
     return
         pa_idxset_string_hash_func(t->name) +
-        pa_idxset_string_hash_func(t->type) +
+        pa_idxset_string_hash_func(t->type);
 }
 
 static unsigned tunnel_hash(const void *p) {
@@ -353,9 +353,11 @@ static void browser_cb(
  * A new resolver given a query protocol of UNSPEC will default to querying
  * with INET6. A new resolver given an address protocol of UNSPEC will always
  * resolve a service to an address matching the query protocol. So a resolver
- * with UNSPEC/UNSPEC is equivalent to INET6/INET6. Strangely, INET addresses
- * via INET6 queries fail to resolve; all other combinations succeed (avahi
- * 0.7). */
+ * with UNSPEC/UNSPEC is equivalent to INET6/INET6. By default the avahi daemon
+ * publishes AAAA (IPv6) records over IPv4, but not A (IPv4) records over IPv6
+ * (see 'publish-aaaa-on-ipv4' and 'publish-a-on-ipv6' in 'avahi-daemon.conf').
+ * That's why, given most daemons, all four combinations of concrete query and
+ * address protocols resolve except INET addresses via INET6 queries. */
 
 static void client_callback(AvahiClient *c, AvahiClientState state, void *userdata) {
     struct userdata *u = userdata;
@@ -413,7 +415,8 @@ static void client_callback(AvahiClient *c, AvahiClientState state, void *userda
                 /* Frees all associated resources, i.e. browsers, resolvers,
                  * and groups. */
                 avahi_client_free(c);
-                u->client = u->sink_browser = u->source_browser = NULL;
+                u->client = NULL;
+                u->sink_browser = u->source_browser = NULL;
 
                 if (!avahi_client_new(u->avahi_poll, AVAHI_CLIENT_NO_FAIL, client_callback, u, &error)) {
                     pa_log("avahi_client_new() failed: %s", avahi_strerror(error));
@@ -447,8 +450,9 @@ int pa__init(pa_module*m) {
 
     struct userdata *u;
     pa_modargs *ma = NULL;
-    bool disable_ipv4, disable_ipv6;
-    bool one_per_name_type;
+    bool disable_ipv4 = false;
+    bool disable_ipv6 = false;
+    bool one_per_name_type = false;
     AvahiProtocol protocol;
     int error;
 
@@ -486,7 +490,8 @@ int pa__init(pa_module*m) {
     m->userdata = u = pa_xnew(struct userdata, 1);
     u->core = m->core;
     u->module = m;
-    u->client = u->sink_browser = u->source_browser = NULL;
+    u->client = NULL;
+    u->sink_browser = u->source_browser = NULL;
     u->protocol = protocol;
 
     if (one_per_name_type)
