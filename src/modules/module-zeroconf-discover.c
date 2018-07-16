@@ -57,26 +57,49 @@ static const char* const valid_modargs[] = {
     NULL
 };
 
-struct tunnel {
-    AvahiIfIndex interface;
-    AvahiProtocol protocol;
-    char *name, *type, *domain;
-    uint32_t module_index;
-};
-
 struct userdata {
     pa_core *core;
     pa_module *module;
+
+    pa_hook_slot *module_unlink_slot;
+
     AvahiPoll *avahi_poll;
     AvahiClient *client;
     AvahiServiceBrowser *source_browser, *sink_browser;
     AvahiProtocol protocol;
 
-    pa_hashmap *tunnels;
+    pa_hashmap *tunnels_loaded;
+    pa_hashmap *tunnels_loaded_by_index;
+    pa_hashmap *tunnels_queued;
 };
 
+typedef struct {
+    pa_object parent;
+
+    struct userdata *userdata;
+
+    AvahiIfIndex interface;
+    AvahiProtocol protocol;
+    char *name, *type, *domain;
+
+    uint32_t module_index;
+} tunnel;
+
+PA_DEFINE_PRIVATE_CLASS(tunnel, pa_object);
+
+static int module_index_compare(const void *a, const void *b) {
+    uint32_t idx_a = *(uint32_t *)a;
+    uint32_t idx_b = *(uint32_t *)b;
+    return idx_a < idx_b ? -1 : (idx_a > idx_b ? 1 : 0);
+}
+
+static unsigned module_index_hash(const void *p) {
+    uint32_t idx_p = *(uint32_t *)p;
+    return (unsigned) idx_p;
+}
+
 static unsigned tunnel_hash_simple(const void *p) {
-    const struct tunnel *t = p;
+    const tunnel *t = p;
 
     return
         pa_idxset_string_hash_func(t->name) +
@@ -84,7 +107,7 @@ static unsigned tunnel_hash_simple(const void *p) {
 }
 
 static unsigned tunnel_hash(const void *p) {
-    const struct tunnel *t = p;
+    const tunnel *t = p;
 
     return
         (unsigned) t->interface +
@@ -95,7 +118,7 @@ static unsigned tunnel_hash(const void *p) {
 }
 
 static int tunnel_compare_simple(const void *a, const void *b) {
-    const struct tunnel *ta = a, *tb = b;
+    const tunnel *ta = a, *tb = b;
     int r;
 
     if ((r = strcmp(ta->name, tb->name)))
@@ -107,7 +130,7 @@ static int tunnel_compare_simple(const void *a, const void *b) {
 }
 
 static int tunnel_compare(const void *a, const void *b) {
-    const struct tunnel *ta = a, *tb = b;
+    const tunnel *ta = a, *tb = b;
     int r;
 
     if (ta->interface != tb->interface)
@@ -124,12 +147,31 @@ static int tunnel_compare(const void *a, const void *b) {
     return 0;
 }
 
-static struct tunnel *tunnel_new(
+static void tunnel_free(tunnel *t) {
+    pa_assert(t);
+    pa_xfree(t->name);
+    pa_xfree(t->type);
+    pa_xfree(t->domain);
+    pa_xfree(t);
+}
+
+static void tunnel_ref_free(pa_object *o) {
+    tunnel *t = tunnel_cast(o);
+
+    pa_assert(t);
+    pa_assert(!tunnel_refcnt(t));
+
+    tunnel_free(t);
+}
+
+static tunnel *tunnel_new(
+        struct userdata *u,
         AvahiIfIndex interface, AvahiProtocol protocol,
         const char *name, const char *type, const char *domain) {
 
-    struct tunnel *t;
-    t = pa_xnew(struct tunnel, 1);
+    tunnel *t = pa_object_new(tunnel);
+    t->parent.free = tunnel_ref_free;
+    t->userdata = u;
     t->interface = interface;
     t->protocol = protocol;
     t->name = pa_xstrdup(name);
@@ -139,12 +181,8 @@ static struct tunnel *tunnel_new(
     return t;
 }
 
-static void tunnel_free(struct tunnel *t) {
-    pa_assert(t);
-    pa_xfree(t->name);
-    pa_xfree(t->type);
-    pa_xfree(t->domain);
-    pa_xfree(t);
+static bool tunnel_loaded(tunnel *t) {
+    return t->module_index != PA_IDXSET_INVALID;
 }
 
 static void resolver_cb(
@@ -157,26 +195,34 @@ static void resolver_cb(
         AvahiLookupResultFlags flags,
         void *userdata) {
 
-    struct userdata *u = userdata;
-    struct tunnel *tnl = NULL;
+    bool remove = false;
+    tunnel *tnl = userdata;
+    struct userdata *u;
+
+    pa_assert(tnl);
+
+    u = tnl->userdata;
 
     pa_assert(u);
 
+    pa_assert(tnl->interface == interface && tnl->protocol == protocol &&
+              !strcmp(tnl->name, name) && !strcmp(tnl->type, type) && !strcmp(tnl->domain, domain));
+
+    /* Doesn't exist; exists but different; exists but already loaded */
+    if (pa_hashmap_get(u->tunnels_loaded, tnl) != tnl || tunnel_loaded(tnl))
+        goto finish;
+
     if (u->protocol != AVAHI_PROTO_UNSPEC && u->protocol != protocol) {
         pa_log_warn("Expected address protocol '%i' but received '%i'", u->protocol, protocol);
+        remove = true;
         goto finish;
     }
 
-    tnl = tunnel_new(interface, protocol, name, type, domain);
-
-    if (pa_hashmap_get(u->tunnels, tnl)) {
-        pa_log_debug("Tunnel [%i,%i,%s,%s,%s] already mapped, skipping.",
-                     interface, protocol, name, type, domain);
-        goto finish;
-    }
-
-    if (event != AVAHI_RESOLVER_FOUND)
+    if (event != AVAHI_RESOLVER_FOUND) {
         pa_log("Resolving of '%s' failed: %s", name, avahi_strerror(avahi_client_errno(u->client)));
+        remove = true;
+        goto finish;
+    }
     else {
         char *device = NULL, *dname, *module_name, *args;
         const char *t;
@@ -225,6 +271,7 @@ static void resolver_cb(
             pa_log("Service '%s' contains an invalid sample specification.", name);
             avahi_free(device);
             pa_xfree(properties);
+            remove = true;
             goto finish;
         }
 
@@ -232,6 +279,7 @@ static void resolver_cb(
             pa_log("Service '%s' contains an invalid channel map.", name);
             avahi_free(device);
             pa_xfree(properties);
+            remove = true;
             goto finish;
         }
 
@@ -245,6 +293,7 @@ static void resolver_cb(
             avahi_free(device);
             pa_xfree(dname);
             pa_xfree(properties);
+            remove = true;
             goto finish;
         }
 
@@ -277,9 +326,10 @@ static void resolver_cb(
 
         if (pa_module_load(&m, u->core, module_name, args) >= 0) {
             tnl->module_index = m->index;
-            pa_hashmap_put(u->tunnels, tnl, tnl);
-            tnl = NULL;
+            pa_hashmap_put(u->tunnels_loaded_by_index, &tnl->module_index, tnl);
         }
+        else
+            remove = true;
 
         pa_xfree(module_name);
         pa_xfree(dname);
@@ -291,10 +341,72 @@ static void resolver_cb(
 
 finish:
 
-    avahi_service_resolver_free(r);
+    if (remove) {
+        pa_hashmap_remove(u->tunnels_loaded, tnl);
+        tunnel_unref(tnl);
+    }
 
-    if (tnl)
-        tunnel_free(tnl);
+    avahi_service_resolver_free(r);
+    tunnel_unref(tnl);
+    return;
+}
+
+static void tunnel_add_from_queue_cb(pa_mainloop_api *a, pa_defer_event *e, void *userdata) {
+    tunnel *t_search = userdata;
+    tunnel *t_queued;
+    struct userdata *u;
+    void *state;
+
+    pa_assert(t_search);
+
+    u = t_search->userdata;
+
+    pa_assert(u);
+
+    if (pa_hashmap_get(u->tunnels_loaded, t_search))
+        goto finish;
+
+    PA_HASHMAP_FOREACH(t_queued, u->tunnels_queued, state) {
+        if (!tunnel_compare_simple(t_queued, t_search)) {
+            if (!avahi_service_resolver_new(u->client, t_queued->interface, t_queued->protocol,
+                                            t_queued->name, t_queued->type, t_queued->domain, u->protocol,
+                                            0, resolver_cb, t_queued)) {
+                pa_log("avahi_service_resolver_new() failed: %s", avahi_strerror(avahi_client_errno(u->client)));
+                continue;
+            }
+            tunnel_ref(t_queued);
+            pa_hashmap_remove(u->tunnels_queued, t_queued);
+            pa_hashmap_put(u->tunnels_loaded, t_queued, t_queued);
+            break;
+        }
+    }
+
+finish:
+
+    tunnel_unref(t_search);
+    a->defer_free(e);
+}
+
+static pa_hook_result_t tunnel_remove_cb(void *hook_data, void *call_data, void *slot_data) {
+    struct userdata *u = slot_data;
+    pa_module *m = call_data;
+
+    tunnel *t;
+
+    pa_assert(u);
+    pa_assert(m);
+
+    if (!(t = pa_hashmap_remove(u->tunnels_loaded_by_index, &m->index)))
+        return PA_HOOK_OK;
+
+    pa_assert(pa_hashmap_remove(u->tunnels_loaded, t) == t);
+
+    if (u->tunnels_queued)
+        u->core->mainloop->defer_new(u->core->mainloop, tunnel_add_from_queue_cb, t);
+    else
+        tunnel_unref(t);
+
+    return PA_HOOK_OK;
 }
 
 static void browser_cb(
@@ -306,11 +418,16 @@ static void browser_cb(
         void *userdata) {
 
     struct userdata *u = userdata;
-    struct tunnel *t;
+    tunnel *t_new;
+    tunnel *t_old_loaded;
+    tunnel *t_old_queued;
 
     pa_assert(u);
 
     if (flags & AVAHI_LOOKUP_RESULT_LOCAL)
+        return;
+
+    if (event != AVAHI_BROWSER_NEW && event != AVAHI_BROWSER_REMOVE)
         return;
 
     if (u->protocol != AVAHI_PROTO_UNSPEC && u->protocol != protocol) {
@@ -318,33 +435,61 @@ static void browser_cb(
         return;
     }
 
-    t = tunnel_new(interface, protocol, name, type, domain);
+    t_new = tunnel_new(u, interface, protocol, name, type, domain);
 
     if (event == AVAHI_BROWSER_NEW) {
 
-        /* Since the resolver is asynchronous and the hashmap may not yet be
-         * updated, this check must be duplicated in the resolver callback. */
-        if (!pa_hashmap_get(u->tunnels, t))
-            if (!(avahi_service_resolver_new(u->client, interface, protocol, name, type, domain, u->protocol, 0, resolver_cb, u)))
+        if (!(t_old_loaded = pa_hashmap_get(u->tunnels_loaded, t_new))) {
+            /* We ignore the returned resolver object here, since the we don't
+             * need to attach any special data to it, and we can still destroy
+             * it from the callback */
+            if (!avahi_service_resolver_new(u->client, interface, protocol, name, type, domain, u->protocol, 0, resolver_cb, t_new)) {
                 pa_log("avahi_service_resolver_new() failed: %s", avahi_strerror(avahi_client_errno(u->client)));
-
-        /* We ignore the returned resolver object here, since the we don't
-         * need to attach any special data to it, and we can still destroy
-         * it from the callback */
+                tunnel_unref(t_new);
+                return;
+            }
+            if (u->tunnels_queued && (t_old_queued = pa_hashmap_remove(u->tunnels_queued, t_new))) {
+                tunnel_unref(t_old_queued);
+            }
+            pa_hashmap_put(u->tunnels_loaded, t_new, t_new);
+            tunnel_ref(t_new);
+            return;
+        }
+        else if (u->tunnels_queued && tunnel_compare(t_new, t_old_loaded) && !pa_hashmap_get(u->tunnels_queued, t_new)) {
+            pa_hashmap_put(u->tunnels_queued, t_new, t_new);
+            return;
+        }
+        tunnel_unref(t_new);
+        return;
 
     } else if (event == AVAHI_BROWSER_REMOVE) {
-        struct tunnel *t2 = pa_hashmap_get(u->tunnels, t);
 
-        /* A full comparison is required even if 'one_per_name_type' is true.
-         * Yes, this is redundant if it's false. */
-        if (t2 && !tunnel_compare(t2, t)) {
-            pa_module_unload_request_by_index(u->core, t2->module_index, true);
-            pa_hashmap_remove(u->tunnels, t2);
-            tunnel_free(t2);
+        if (u->tunnels_queued) {
+            if ((t_old_queued = pa_hashmap_remove(u->tunnels_queued, t_new))) {
+                tunnel_unref(t_old_queued);
+            }
+            if ((t_old_loaded = pa_hashmap_get(u->tunnels_loaded, t_new)) && !tunnel_compare(t_new, t_old_loaded)) {
+                pa_hashmap_remove(u->tunnels_loaded, t_old_loaded);
+                pa_hashmap_remove(u->tunnels_loaded_by_index, &t_old_loaded->module_index);
+                pa_module_unload_request_by_index(u->core, t_old_loaded->module_index, true);
+                /* Allow queued AVAHI_BROWSER_REMOVE events to be processed
+                 * first. The event object is ignored as it can be destroyed
+                 * from the callback. */
+                u->core->mainloop->defer_new(u->core->mainloop, tunnel_add_from_queue_cb, t_old_loaded);
+            }
         }
-    }
+        else if ((t_old_loaded = pa_hashmap_remove(u->tunnels_loaded, t_new))) {
+            pa_hashmap_remove(u->tunnels_loaded, t_old_loaded);
+            pa_hashmap_remove(u->tunnels_loaded_by_index, &t_old_loaded->module_index);
+            pa_module_unload_request_by_index(u->core, t_old_loaded->module_index, true);
+            tunnel_unref(t_old_loaded);
+        }
+        tunnel_unref(t_new);
+        return;
 
-    tunnel_free(t);
+    } else
+
+        tunnel_unref(t_new);
 }
 
 /* Avahi browser and resolver callbacks only receive a concrete protocol;
@@ -494,10 +639,16 @@ int pa__init(pa_module*m) {
     u->sink_browser = u->source_browser = NULL;
     u->protocol = protocol;
 
-    if (one_per_name_type)
-        u->tunnels = pa_hashmap_new(tunnel_hash_simple, tunnel_compare_simple);
-    else
-        u->tunnels = pa_hashmap_new(tunnel_hash, tunnel_compare);
+    if (one_per_name_type) {
+        u->tunnels_loaded = pa_hashmap_new(tunnel_hash_simple, tunnel_compare_simple);
+        u->tunnels_queued = pa_hashmap_new(tunnel_hash, tunnel_compare);
+    }
+    else {
+        u->tunnels_loaded = pa_hashmap_new(tunnel_hash, tunnel_compare);
+        u->tunnels_queued = NULL;
+    }
+    u->tunnels_loaded_by_index = pa_hashmap_new(module_index_hash, module_index_compare);
+
 
     u->avahi_poll = pa_avahi_poll_new(m->core->mainloop);
 
@@ -513,6 +664,8 @@ int pa__init(pa_module*m) {
         goto fail;
     }
 
+    u->module_unlink_slot = pa_hook_connect(&u->core->hooks[PA_CORE_HOOK_MODULE_UNLINK], PA_HOOK_NORMAL, tunnel_remove_cb, u);
+
     pa_modargs_free(ma);
 
     return 0;
@@ -527,7 +680,8 @@ fail:
 }
 
 void pa__done(pa_module*m) {
-    struct userdata*u;
+    struct userdata *u;
+    tunnel *t;
     pa_assert(m);
 
     if (!(u = m->userdata))
@@ -539,16 +693,32 @@ void pa__done(pa_module*m) {
     if (u->avahi_poll)
         pa_avahi_poll_free(u->avahi_poll);
 
-    if (u->tunnels) {
-        struct tunnel *t;
+    if (u->tunnels_queued) {
+        while ((t = pa_hashmap_steal_first(u->tunnels_queued)))
+            tunnel_free(t);
 
-        while ((t = pa_hashmap_steal_first(u->tunnels))) {
+        pa_hashmap_free(u->tunnels_queued);
+    }
+
+    if (u->tunnels_loaded) {
+        while ((t = pa_hashmap_steal_first(u->tunnels_loaded))) {
+            if (u->tunnels_loaded_by_index)
+                pa_assert(pa_hashmap_remove(u->tunnels_loaded_by_index, &t->module_index) == t);
             pa_module_unload_request_by_index(u->core, t->module_index, true);
             tunnel_free(t);
         }
 
-        pa_hashmap_free(u->tunnels);
+        if (u->tunnels_loaded_by_index)
+            pa_assert(pa_hashmap_isempty(u->tunnels_loaded_by_index));
+
+        pa_hashmap_free(u->tunnels_loaded);
     }
+
+    if (u->tunnels_loaded_by_index)
+        pa_hashmap_free(u->tunnels_loaded_by_index);
+
+    if (u->module_unlink_slot)
+        pa_hook_slot_free(u->module_unlink_slot);
 
     pa_xfree(u);
 }
